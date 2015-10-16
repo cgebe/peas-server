@@ -5,6 +5,7 @@ import java.io.FileInputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.net.URISyntaxException;
+import java.util.Map;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
@@ -15,21 +16,27 @@ import javax.crypto.spec.SecretKeySpec;
 import org.apache.commons.codec.binary.Base64;
 import org.apache.commons.io.IOUtils;
 
-import protocol.PEASBody;
-import protocol.PEASHeader;
-import protocol.PEASMessage;
 import util.Config;
 import util.Encryption;
+import util.HttpFormatException;
+import util.HttpRequestParser;
 import util.Pair;
+import io.netty.bootstrap.Bootstrap;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
+import io.netty.channel.Channel;
 import io.netty.channel.ChannelFuture;
 import io.netty.channel.ChannelFutureListener;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.SimpleChannelInboundHandler;
+import io.netty.handler.codec.http.DefaultFullHttpRequest;
+import io.netty.handler.codec.http.FullHttpRequest;
+import io.netty.handler.codec.http.HttpMethod;
 import io.netty.handler.codec.http.HttpObject;
 import io.netty.handler.codec.http.HttpRequest;
-import io.netty.util.ReferenceCountUtil;
+import io.netty.handler.codec.http.HttpVersion;
+import issuer.handler.dispatch.upstream.DispatchChannelInitializer;
+import issuer.server.IssuerServer;
 
 import org.bouncycastle.crypto.InvalidCipherTextException;
 import org.bouncycastle.crypto.encodings.PKCS1Encoding;
@@ -37,7 +44,6 @@ import org.bouncycastle.crypto.engines.RSAEngine;
 import org.bouncycastle.crypto.params.AsymmetricKeyParameter;
 import org.bouncycastle.crypto.util.PrivateKeyFactory;
 
-import com.squareup.crypto.rsa.NativeRSAEngine;
 
 public class QueryHandler extends SimpleChannelInboundHandler<HttpObject> {
 
@@ -65,7 +71,6 @@ public class QueryHandler extends SimpleChannelInboundHandler<HttpObject> {
 	@Override
 	public void exceptionCaught(ChannelHandlerContext arg0, Throwable arg1) throws Exception {
 		// TODO Auto-generated method stub
-
 	}
 
 	@Override
@@ -129,13 +134,12 @@ public class QueryHandler extends SimpleChannelInboundHandler<HttpObject> {
 	
     public class QueryHandlerThread implements Runnable {
         
-         
         private ChannelHandlerContext ctx;
-		private HttpRequest req;
+		private FullHttpRequest req;
 
 		public QueryHandlerThread(ChannelHandlerContext ctx, HttpRequest req){
             this.ctx = ctx;
-            this.req = req;
+            this.req = (FullHttpRequest) req;
         }
      
         @Override
@@ -147,32 +151,29 @@ public class QueryHandler extends SimpleChannelInboundHandler<HttpObject> {
 				System.out.println(keyAndQery.getElement1());
 				System.out.println();
 				
-				String content = new String(Encryption.AESdecrypt(req.ge.array(), keyAndQery.getElement0(), iv));
+				String content = new String(Encryption.AESdecrypt(req.duplicate().content().array(), keyAndQery.getElement0(), iv));
 				System.out.println("content:");
 				System.out.println(content);
 				
-				// simulate search engine request#
-				int size = Integer.parseInt(Config.getInstance().getValue("TEST_PAYLOAD_SIZE"));
-				PEASHeader header = new PEASHeader();
-				header.setCommand("RESPONSE");
-				header.setIssuer(obj.getHeader().getIssuer());
-				header.setReceiverID(obj.getHeader().getReceiverID());
-				header.setStatus("100");
-				header.setProtocol("HTTP");
-				
-				byte[] b = new byte[size];
-				//new Random().nextBytes(b);
-				byte[] enc = Encryption.AESencrypt(b, keyAndQery.getElement0(), iv);
-				
-				header.setContentLength(enc.length);
-				PEASBody body = new PEASBody(enc);
-				
-				PEASMessage res = new PEASMessage(header, body);
-				if (Config.getInstance().getValue("MEASURE_PROCESS_TIME").equals("on")) {
-					res.setCreationTime(obj.getCreationTime());
+				// create search engine request out of decrypted content
+				FullHttpRequest searchReq = null;
+				try {
+					searchReq = createHttpRequest(content);
+				} catch (HttpFormatException | IOException e) {
+					// return invalid reponse
 				}
+				
+				// send request to search engine
+				// Start the connection attempt.
+		        Bootstrap b = new Bootstrap();
+		        b.group(ctx.channel().eventLoop())
+		         .channel(ctx.channel().getClass())
+		         .handler(new DispatchChannelInitializer(ctx.channel()));
+		        
+		        ChannelFuture c = b.connect(searchReq.headers().get("Host"), 80);
+		        
 				// send response back
-	            ChannelFuture f = ctx.writeAndFlush(res);
+	            ChannelFuture f = ctx.writeAndFlush(searchReq);
 	            
 	            f.addListener(new ChannelFutureListener() {
 	                @Override
@@ -189,7 +190,86 @@ public class QueryHandler extends SimpleChannelInboundHandler<HttpObject> {
 				e.printStackTrace();
 			}
         }
+
+
      
+    }
+    
+    private FullHttpRequest createHttpRequest(String requestString) throws IOException, HttpFormatException {
+		HttpRequestParser parser = new HttpRequestParser();
+		
+		// parse request String
+		parser.parseRequest(requestString);
+		
+		// create the request to the search engine
+		HttpVersion version = convertRequestVersion(parser.getRequestHttpVersion());
+		HttpMethod method = convertRequestMethod(parser.getRequestMethod());
+		
+		// construct request with request line
+		FullHttpRequest req = new DefaultFullHttpRequest(version, method, parser.getRequestPath());
+
+		// add all header fields
+    	for (Map.Entry<String, String> entry : parser.headers().entrySet()) {
+    		req.headers().set(entry.getKey(), entry.getValue());
+    	}
+    	
+    	// add message content if available
+    	if (parser.getMessageBody() != null) {
+    		req.content().writeBytes(parser.getMessageBody().getBytes());
+    	}
+    	
+    	return req;
+    }
+    
+	private HttpVersion convertRequestVersion(String requestHttpVersion) {
+		HttpVersion version;
+		switch(requestHttpVersion) {
+		case "HTTP/1.0":
+			version = HttpVersion.HTTP_1_0;
+			break;
+		case "HTTP/1.1":
+			version = HttpVersion.HTTP_1_1;
+			break;
+		default:
+			version = null;
+		}
+		return version;
+	}
+    
+    private HttpMethod convertRequestMethod(String requestMethod) {
+    	HttpMethod method;
+    	switch(requestMethod) {
+		case "CONNECT":
+			method = HttpMethod.CONNECT;
+			break;
+		case "DELETE":
+			method = HttpMethod.DELETE;
+			break;
+		case "HEAD":
+			method = HttpMethod.HEAD;
+			break;
+		case "GET":
+			method = HttpMethod.GET;
+			break;
+		case "OPTIONS":
+			method = HttpMethod.OPTIONS;
+			break;
+		case "PATCH":
+			method = HttpMethod.PATCH;
+			break;
+		case "POST":
+			method = HttpMethod.POST;
+			break;
+		case "PUT":
+			method = HttpMethod.PUT;
+			break;
+		case "TRACE":
+			method = HttpMethod.TRACE;
+			break;
+		default:
+			method = null;
+		}
+    	return method;
     }
 
 }

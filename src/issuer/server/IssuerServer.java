@@ -18,7 +18,6 @@ public class IssuerServer {
 
     public IssuerServer(int port) {
         this.port = port;
-
         ResourceLeakDetector.setLevel(ResourceLeakDetector.Level.ADVANCED);
     }
 
@@ -53,5 +52,6 @@ public class IssuerServer {
         //new IssuerServer(Integer.parseInt(Config.getInstance().getValue("port"))).run();
     	new IssuerServer(11779).run();
     }
+    
     
 }
